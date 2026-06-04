@@ -165,23 +165,73 @@ TensorPtr memory_efficient_attention(
     if (q->requires_grad() || k->requires_grad() || v->requires_grad()) {
         context->set_requires_grad(true);
         
-        // TODO: implement backward for memory-efficient attention
-        // Current strategy: fall back to standard attention or manual grads when training
-        // Full implementation needs max_score/sum_exp saved or recomputed in backward
-        context->set_grad_fn([q, k, v, causal_mask, scale](const TensorPtr& grad_output) -> std::vector<TensorPtr> {
-            // Placeholder: notify user that full backward is needed
-            std::cerr << "[WARN] memory_efficient_attention backward not fully implemented yet" << std::endl;
-            
-            // Return zero grads for now (implement full backward or switch to standard attention when needed)
-            auto grad_q = zeros(q->shape(), q->dtype(), q->device());
-            auto grad_k = zeros(k->shape(), k->dtype(), k->device());
-            auto grad_v = zeros(v->shape(), v->dtype(), v->device());
-            
-            return {grad_q, grad_k, grad_v};
+        // Save attn_weights during forward for backward correctness
+        std::vector<float> saved_aw(B * H * S * S);
+        for (int b = 0; b < B; ++b) {
+            for (int h = 0; h < H; ++h) {
+                const float* q_bh = q->data<float>() + ((b * H + h) * S) * D;
+                const float* k_bh = k->data<float>() + ((b * H + h) * S) * D;
+                float* aw_bh = saved_aw.data() + ((b * H + h) * S) * S;
+                for (int i = 0; i < S; ++i) {
+                    float max_s = -1e30f;
+                    for (int j = 0; j <= i; ++j) {
+                        float s = 0.0f;
+                        for (int d = 0; d < D; ++d) s += q_bh[i*D+d] * k_bh[j*D+d];
+                        s *= scale; if (s > max_s) max_s = s;
+                        aw_bh[i*S+j] = s;
+                    }
+                    for (int j = i+1; j < S; ++j) aw_bh[i*S+j] = -1e10f;
+                    float sum_e = 0.0f;
+                    for (int j = 0; j < S; ++j) { aw_bh[i*S+j] = std::exp(aw_bh[i*S+j] - max_s); sum_e += aw_bh[i*S+j]; }
+                    for (int j = 0; j < S; ++j) aw_bh[i*S+j] /= sum_e;
+                }
+            }
+        }
+        
+        context->set_grad_fn([q, k, v, causal_mask, scale, saved_aw = std::move(saved_aw)](const TensorPtr& grad_output) -> std::vector<TensorPtr> {
+            int B = q->shape()[0], H = q->shape()[1], S = q->shape()[2], D = q->shape()[3];
+            const float* go = grad_output->data<float>();
+            const float* qd = q->data<float>(), *kd = k->data<float>(), *vd = v->data<float>();
+            const float* aw = saved_aw.data();
+            auto gq = zeros(q->shape(), q->dtype(), q->device());
+            auto gk = zeros(k->shape(), k->dtype(), k->device());
+            auto gv = zeros(v->shape(), v->dtype(), v->device());
+            float* gqd = gq->data<float>(), *gkd = gk->data<float>(), *gvd = gv->data<float>();
+            for (int b = 0; b < B; ++b) {
+                for (int h = 0; h < H; ++h) {
+                    const float* go_bh = go + ((b*H+h)*S)*D;
+                    const float* q_bh = qd + ((b*H+h)*S)*D;
+                    const float* k_bh = kd + ((b*H+h)*S)*D;
+                    const float* v_bh = vd + ((b*H+h)*S)*D;
+                    const float* aw_bh = aw + ((b*H+h)*S)*S;
+                    float* gq_bh = gqd + ((b*H+h)*S)*D;
+                    float* gk_bh = gkd + ((b*H+h)*S)*D;
+                    float* gv_bh = gvd + ((b*H+h)*S)*D;
+                    // grad_v = aw^T @ go
+                    for (int j = 0; j < S; ++j)
+                        for (int d = 0; d < D; ++d) { float s = 0.0f; for (int i = 0; i < S; ++i) s += aw_bh[i*S+j]*go_bh[i*D+d]; gv_bh[j*D+d] = s; }
+                    // grad_attn = go @ v^T
+                    std::vector<float> ga(S*S, 0.0f);
+                    for (int i = 0; i < S; ++i)
+                        for (int j = 0; j < S; ++j) { float s = 0.0f; for (int d = 0; d < D; ++d) s += go_bh[i*D+d]*v_bh[j*D+d]; ga[i*S+j] = s; }
+                    // softmax backward
+                    for (int i = 0; i < S; ++i) {
+                        float dot = 0.0f;
+                        for (int j = 0; j < S; ++j) dot += ga[i*S+j]*aw_bh[i*S+j];
+                        for (int j = 0; j < S; ++j) ga[i*S+j] = aw_bh[i*S+j]*(ga[i*S+j] - dot);
+                    }
+                    for (int i = 0; i < S; ++i) for (int j = i+1; j < S; ++j) ga[i*S+j] = 0.0f;
+                    // grad_q = ga @ k * scale
+                    for (int i = 0; i < S; ++i)
+                        for (int d = 0; d < D; ++d) { float s = 0.0f; for (int j = 0; j < S; ++j) s += ga[i*S+j]*k_bh[j*D+d]; gq_bh[i*D+d] = s*scale; }
+                    // grad_k = ga^T @ q * scale
+                    for (int j = 0; j < S; ++j)
+                        for (int d = 0; d < D; ++d) { float s = 0.0f; for (int i = 0; i < S; ++i) s += ga[i*S+j]*q_bh[i*D+d]; gk_bh[j*D+d] = s*scale; }
+                }
+            }
+            return {gq, gk, gv};
         });
     }
-    
-    return context;
 }
 
 } // namespace ops
