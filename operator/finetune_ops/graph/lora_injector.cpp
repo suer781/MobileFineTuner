@@ -373,15 +373,108 @@ std::vector<TensorPtr> LoraInjector::get_trainable_params() {
 // ============================================================================
 
 void LoraInjector::save_lora_safetensors(const std::string& path) const {
-    // TODO: implement safetensors writing
-    // Key format: lora.blocks.{i}.{target}.{q/k/v}.A, .B
-    // Metadata: meta.rank, meta.alpha, meta.dropout, meta.split_qkv
-    std::cout << "[LoraInjector] save_lora_safetensors: TODO (path=" << path << ")" << std::endl;
+    if (hooks_.empty()) {
+        std::cerr << "[LoraInjector] save: no hooks, nothing to save" << std::endl;
+        return;
+    }
+    std::ofstream out(path, std::ios::binary);
+    if (!out) { std::cerr << "[LoraInjector] save: cannot open " << path << std::endl; return; }
+
+    std::map<std::string, std::string> tensors_json;
+    std::vector<uint8_t> data_buf;
+    size_t offset = 0;
+    static const char* tnames[] = {"attn.qkv", "attn.proj", "mlp.fc_in", "mlp.fc_out"};
+
+    auto add_tensor = [&](const std::string& name, const Tensor& t) {
+        size_t nb = t.nbytes();
+        std::string shape = "[";
+        for (int d = 0; d < t.dim(); ++d) { if (d) shape += ", "; shape += std::to_string(t.size(d)); }
+        shape += "]";
+        tensors_json[name] = "{\"dtype\":\"F32\",\"shape\":" + shape +
+            ",\"data_offsets\":[" + std::to_string(offset) + "," + std::to_string(offset + nb) + "]}";
+        data_buf.insert(data_buf.end(), reinterpret_cast<const uint8_t*>(t.data_ptr()),
+                       reinterpret_cast<const uint8_t*>(t.data_ptr()) + nb);
+        offset += nb;
+    };
+
+    for (size_t h = 0; h < hooks_.size(); ++h) {
+        const auto& hook = hooks_[h];
+        const char* tgt = (hook.target >= 0 && hook.target < 4) ? tnames[hook.target] : "unknown";
+        std::string prefix = "layer." + std::to_string(hook.layer_idx) + "." + tgt;
+        add_tensor(prefix + ".lora_A", hook.state.A);
+        add_tensor(prefix + ".lora_B", hook.state.B);
+    }
+
+    std::string header = "{";
+    bool first = true;
+    for (auto& [name, tj] : tensors_json) {
+        if (!first) header += ",";
+        header += "\" + name + "\":" + tj; first = false;
+    }
+    header += ",\"__metadata__\":{\"rank\":\"" + std::to_string(config_.rank) + "\"";
+    header += ",\"alpha\":\"" + std::to_string(config_.alpha) + "\"";
+    header += ",\"dropout\":\"" + std::to_string(config_.dropout) + "\"";
+    header += ",\"split_qkv\":\"" + std::string(config_.split_qkv ? "true" : "false") + "\"}}";
+
+    uint64_t hlen = header.size();
+    out.write(reinterpret_cast<const char*>(&hlen), 8);
+    out.write(header.c_str(), hlen);
+    out.write(reinterpret_cast<const char*>(data_buf.data()), data_buf.size());
+    out.close();
+    std::cout << "[LoraInjector] Saved " << tensors_json.size() << " tensors to " << path << std::endl;
 }
 
 void LoraInjector::load_lora_safetensors(const std::string& path) {
-    // TODO: load LoRA A/B from safetensors
-    std::cout << "[LoraInjector] load_lora_safetensors: TODO (path=" << path << ")" << std::endl;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { std::cerr << "[LoraInjector] load: cannot open " << path << std::endl; return; }
+
+    uint64_t hlen = 0;
+    in.read(reinterpret_cast<char*>(&hlen), 8);
+    std::string header(hlen, '\0');
+    in.read(&header[0], hlen);
+
+    // Parse metadata
+    std::regex meta_pat(R"("__metadata__"\s*:\s*\{([^}]*)\})");
+    std::smatch m;
+    if (std::regex_search(header, m, meta_pat)) {
+        std::string meta = m[1].str();
+        std::smatch vm;
+        if (std::regex_search(meta, vm, std::regex(R"("rank"\s*:\s*"([^"]*)")")))
+            config_.rank = std::stoi(vm[1].str());
+        if (std::regex_search(meta, vm, std::regex(R"("alpha"\s*:\s*"([^"]*)")")))
+            config_.alpha = std::stof(vm[1].str());
+        if (std::regex_search(meta, vm, std::regex(R"("dropout"\s*:\s*"([^"]*)")")))
+            config_.dropout = std::stof(vm[1].str());
+    }
+
+    // Parse tensor entries
+    std::regex entry_pat(R"("([^"]+)"\s*:\s*\{[^}]*"data_offsets"\s*:\s*\[(\d+),(\d+)\][^}]*\})");
+    auto begin = std::sregex_iterator(header.begin(), header.end(), entry_pat);
+    for (auto it = begin; it != std::sregex_iterator(); ++it) {
+        std::string name = (*it)[1].str();
+        size_t start = std::stoul((*it)[2].str());
+        size_t end_off = std::stoul((*it)[3].str());
+
+        std::smatch km;
+        if (!std::regex_match(name, km, std::regex(R"(layer\.(\d+)\.(.+)\.lora_([AB]))"))) continue;
+        int layer = std::stoi(km[1].str());
+        std::string target_str = km[2].str();
+        bool is_A = (km[3].str() == "A");
+
+        static const char* tnames[] = {"attn.qkv", "attn.proj", "mlp.fc_in", "mlp.fc_out"};
+        for (auto& hook : hooks_) {
+            if (hook.layer_idx != layer) continue;
+            int tgt_idx = -1;
+            for (int t = 0; t < 4; ++t) if (target_str == tnames[t]) { tgt_idx = t; break; }
+            if (tgt_idx < 0 || hook.target != tgt_idx) continue;
+            in.seekg(8 + hlen + start);
+            Tensor& dst = is_A ? hook.state.A : hook.state.B;
+            in.read(reinterpret_cast<char*>(dst.data_ptr()), end_off - start);
+            break;
+        }
+    }
+    in.close();
+    std::cout << "[LoraInjector] Loaded LoRA from " << path << std::endl;
 }
 
 void LoraInjector::merge_all(GPT2Model& model) {
