@@ -230,8 +230,8 @@ void LoRATrainer::train() {
 
 void LoRATrainer::save_lora(const std::string& path) {
     std::cout << "[Trainer] Saving LoRA weights to: " << path << std::endl;
-    // TODO: implement safetensors save
-    // LoraSaver::save(lora_, path);
+    lora_.save_lora_safetensors(path);
+    std::cout << "[Trainer] LoRA save complete." << std::endl;
 }
 
 }  // namespace ops
