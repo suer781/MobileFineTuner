@@ -166,24 +166,24 @@ TensorPtr memory_efficient_attention(
         context->set_requires_grad(true);
         
         // Save attn_weights during forward for backward correctness
-        std::vector<float> saved_aw(B * H * S * S);
-        for (int b = 0; b < B; ++b) {
-            for (int h = 0; h < H; ++h) {
-                const float* q_bh = q->data<float>() + ((b * H + h) * S) * D;
-                const float* k_bh = k->data<float>() + ((b * H + h) * S) * D;
-                float* aw_bh = saved_aw.data() + ((b * H + h) * S) * S;
-                for (int i = 0; i < S; ++i) {
+        std::vector<float> saved_aw(batch * n_head * seq_len * seq_len);
+        for (int b = 0; b < batch; ++b) {
+            for (int h = 0; h < n_head; ++h) {
+                const float* q_bh = q->data<float>() + ((b * n_head + h) * seq_len) * head_dim;
+                const float* k_bh = k->data<float>() + ((b * n_head + h) * seq_len) * head_dim;
+                float* aw_bh = saved_aw.data() + ((b * n_head + h) * seq_len) * seq_len;
+                for (int i = 0; i < seq_len; ++i) {
                     float max_s = -1e30f;
                     for (int j = 0; j <= i; ++j) {
                         float s = 0.0f;
-                        for (int d = 0; d < D; ++d) s += q_bh[i*D+d] * k_bh[j*D+d];
+                        for (int d = 0; d < head_dim; ++d) s += q_bh[i*head_dim+d] * k_bh[j*head_dim+d];
                         s *= scale; if (s > max_s) max_s = s;
-                        aw_bh[i*S+j] = s;
+                        aw_bh[i*seq_len+j] = s;
                     }
-                    for (int j = i+1; j < S; ++j) aw_bh[i*S+j] = -1e10f;
+                    for (int j = i+1; j < seq_len; ++j) aw_bh[i*seq_len+j] = -1e10f;
                     float sum_e = 0.0f;
-                    for (int j = 0; j < S; ++j) { aw_bh[i*S+j] = std::exp(aw_bh[i*S+j] - max_s); sum_e += aw_bh[i*S+j]; }
-                    for (int j = 0; j < S; ++j) aw_bh[i*S+j] /= sum_e;
+                    for (int j = 0; j < seq_len; ++j) { aw_bh[i*seq_len+j] = std::exp(aw_bh[i*seq_len+j] - max_s); sum_e += aw_bh[i*seq_len+j]; }
+                    for (int j = 0; j < seq_len; ++j) aw_bh[i*seq_len+j] /= sum_e;
                 }
             }
         }
